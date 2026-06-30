@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime, timezone
 from sources.hackernews import fetch_hn_stories
 from sources.newsapi import fetch_newsapi_articles
 from sources.rss_feeds import fetch_rss_articles
@@ -8,15 +9,17 @@ from sources.arxiv import fetch_arxiv_papers
 from subscribers.db import get_all_subscribers
 from mailer.sender import send_email
 
-# ── Server-side state (articles live here, model never passes big payloads) ───
+CANDIDATES_PER_CATEGORY = 30
+
+# ── Server-side state ──────────────────────────────────────────────────────────
 _state: dict = {
     "ai": [],
     "startup_jobs": [],
     "immigration": [],
-    "composed": None,   # {"html": ..., "plain": ...}
+    "composed": None,
 }
 
-# ── Tool schemas for OpenRouter ────────────────────────────────────────────────
+# ── Tool schemas ───────────────────────────────────────────────────────────────
 
 TOOL_SCHEMAS = [
     {
@@ -24,7 +27,8 @@ TOOL_SCHEMAS = [
         "function": {
             "name": "get_top_news",
             "description": (
-                "Fetch and store the top N news articles for a category. "
+                "Fetch the 30 most recent articles for a category, have the AI summarize "
+                "and editorially select the best N, then store them. "
                 "Call once per category before compose_newsletter."
             ),
             "parameters": {
@@ -48,8 +52,8 @@ TOOL_SCHEMAS = [
         "function": {
             "name": "compose_newsletter",
             "description": (
-                "Compose the newsletter using the articles already fetched via get_top_news. "
-                "Call this AFTER all three get_top_news calls. No parameters needed."
+                "Compose the newsletter using articles fetched via get_top_news. "
+                "Call AFTER all three get_top_news calls. No parameters needed."
             ),
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
@@ -66,19 +70,12 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "send_newsletter",
-            "description": (
-                "Send the composed newsletter to the given recipients. "
-                "Call compose_newsletter and get_subscribers first."
-            ),
+            "description": "Send the composed newsletter. Call compose_newsletter and get_subscribers first.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "subject": {"type": "string", "description": "Email subject line."},
-                    "recipients": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Email addresses from get_subscribers.",
-                    },
+                    "subject": {"type": "string"},
+                    "recipients": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["subject", "recipients"],
             },
@@ -86,77 +83,144 @@ TOOL_SCHEMAS = [
     },
 ]
 
-# ── Tool implementations ───────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _generate_summaries(articles: list[dict]) -> list[dict]:
-    """Use the LLM to write 2-sentence summaries for articles that lack them."""
+def _parse_date(date_str: str) -> datetime:
+    if not date_str:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(date_str[:19], fmt[:len(fmt)])
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+        except ValueError:
+            continue
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _llm_summarize_and_select(articles: list[dict], category: str, count: int) -> list[dict]:
+    """
+    Single LLM call that:
+    1. Reads all candidate articles (title + existing summary + source)
+    2. Writes a clean 2-sentence summary for each
+    3. Picks the best `count` by relevance and newsworthiness
+    4. Returns them as a JSON list
+    """
     from openai import OpenAI
     from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL
 
-    needs_summary = [a for a in articles if not a.get("summary") or len(a.get("summary", "")) < 30]
-    if not needs_summary:
-        return articles
+    category_label = {
+        "ai": "Artificial Intelligence & Machine Learning",
+        "startup_jobs": "Startups, Tech Jobs & New Skills",
+        "immigration": "US Immigration & Visa Policy",
+    }[category]
+
+    # Build compact article list for the prompt
+    articles_text = ""
+    for i, a in enumerate(articles, 1):
+        existing = (a.get("summary") or "").strip()[:150]
+        articles_text += f"{i}. TITLE: {a['title']}\n   SOURCE: {a.get('source','')}\n"
+        if existing:
+            articles_text += f"   CONTEXT: {existing}\n"
+        articles_text += "\n"
+
+    prompt = f"""You are an editor for "Parks Tech USA Daily Brief", a morning newsletter.
+
+Category: {category_label}
+Task: From the {len(articles)} articles below, select the {count} most newsworthy and relevant ones for today's newsletter. Avoid duplicates on the same topic.
+
+For your selected articles, write a punchy 2-sentence summary that:
+- States what happened and why it matters
+- Is factual, not clickbait
+- Is under 50 words
+
+Return ONLY a valid JSON array. Each object must have these exact keys:
+- "index": the original article number (1-based)
+- "summary": your 2-sentence summary
+
+Example format:
+[{{"index": 3, "summary": "OpenAI released GPT-5 today with 10x improved reasoning. The model outperforms all existing benchmarks and will be available via API next week."}}, ...]
+
+Articles:
+{articles_text}
+
+Return JSON only, no other text."""
 
     client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
-    titles_block = "\n".join(f"{i+1}. {a['title']}" for i, a in enumerate(needs_summary))
 
     try:
         resp = client.chat.completions.create(
             model=OPENROUTER_MODEL,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Write a 2-sentence factual summary for each headline below. "
-                    "Be concise and informative. Return ONLY a numbered list matching the input order.\n\n"
-                    + titles_block
-                )
-            }],
-            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1500,
         )
-        lines = [l.strip() for l in resp.choices[0].message.content.strip().split("\n") if l.strip()]
-        summaries = [l.split(". ", 1)[-1] if l[0].isdigit() else l for l in lines]
+        raw = resp.choices[0].message.content.strip()
 
-        for i, a in enumerate(needs_summary):
-            if i < len(summaries):
-                a["summary"] = summaries[i]
-    except Exception:
-        pass
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
 
-    return articles
+        selected = json.loads(raw.strip())
 
+        result = []
+        for item in selected:
+            idx = int(item["index"]) - 1
+            if 0 <= idx < len(articles):
+                article = dict(articles[idx])
+                article["summary"] = item["summary"]
+                result.append(article)
+
+        if result:
+            return result[:count]
+
+    except Exception as e:
+        print(f"[tools] LLM select/summarize failed: {e} — falling back to recency order")
+
+    # Fallback: just take top N by recency with whatever summaries exist
+    return articles[:count]
+
+
+# ── Tool implementations ───────────────────────────────────────────────────────
 
 def tool_get_top_news(category: str, count: int | str) -> dict:
     count = int(count)
-    # Cap HN at 4 so RSS/NewsAPI articles with real summaries fill the rest
-    hn = fetch_hn_stories(category, limit=10)[:4]
-    rss = fetch_rss_articles(category, limit=20)
-    devto = fetch_devto_articles(category, limit=15)
-    arxiv = fetch_arxiv_papers(category, limit=10) if category == "ai" else []
-    newsapi = fetch_newsapi_articles(category, limit=20)
 
-    # Prefer articles with real summaries first, then fill with HN
-    articles = rss + newsapi + devto + arxiv + hn
+    # Fetch from all sources
+    raw = []
+    raw += fetch_hn_stories(category, limit=20)
+    raw += fetch_rss_articles(category, limit=25)
+    raw += fetch_devto_articles(category, limit=20)
+    raw += fetch_newsapi_articles(category, limit=25)
+    if category == "ai":
+        raw += fetch_arxiv_papers(category, limit=15)
 
+    # Deduplicate by title
     seen = set()
     deduped = []
-    for a in articles:
+    for a in raw:
         key = a["title"].lower()[:60]
         if key and key not in seen:
             seen.add(key)
             deduped.append(a)
 
-    # Score: articles with real summaries get a +50 boost
-    def rank_score(a):
-        has_summary = len(a.get("summary", "")) > 40
-        return a.get("score", 0) + (50 if has_summary else 0)
+    # Sort by most recent first
+    deduped.sort(key=lambda a: _parse_date(a.get("published_at", "")), reverse=True)
 
-    ranked = sorted(deduped, key=rank_score, reverse=True)[:count]
+    # Take top 30 candidates
+    candidates = deduped[:CANDIDATES_PER_CATEGORY]
 
-    # Generate LLM summaries for any still missing
-    ranked = _generate_summaries(ranked)
+    print(f"[tools] {category}: {len(deduped)} total → {len(candidates)} candidates → LLM selects {count}")
 
-    _state[category] = ranked
-    return {"fetched": len(ranked), "category": category, "titles": [a["title"] for a in ranked]}
+    # LLM summarizes all candidates and picks the best `count`
+    selected = _llm_summarize_and_select(candidates, category, count)
+
+    _state[category] = selected
+    return {
+        "fetched": len(selected),
+        "category": category,
+        "titles": [a["title"] for a in selected],
+    }
 
 
 def tool_compose_newsletter() -> dict:
@@ -174,7 +238,6 @@ def tool_compose_newsletter() -> dict:
 
 
 def tool_get_subscribers() -> list[str]:
-    # In CI/CD, read from env var (comma-separated). Falls back to local SQLite.
     env_subscribers = os.getenv("SUBSCRIBERS", "")
     if env_subscribers:
         return [e.strip() for e in env_subscribers.split(",") if e.strip()]
@@ -199,7 +262,7 @@ def tool_send_newsletter(subject: str, recipients: list[str]) -> dict:
     return {"status": "done", "sent": sent, "total": len(recipients)}
 
 
-# ── Dispatcher ────────────────────────────────────────────────────────────────
+# ── Dispatcher ─────────────────────────────────────────────────────────────────
 
 def dispatch_tool(name: str, arguments: str | dict) -> str:
     args = json.loads(arguments) if isinstance(arguments, str) else arguments
