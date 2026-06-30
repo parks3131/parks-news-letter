@@ -1,0 +1,34 @@
+name: Parks Tech USA Daily Newsletter
+
+on:
+  schedule:
+    - cron: "0 11 * * *"  # 6 AM EST (UTC-5) / 7 AM EDT (UTC-4)
+  workflow_dispatch:        # allows manual trigger from GitHub UI anytime
+
+jobs:
+  send-newsletter:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run newsletter agent
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
+          NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          FROM_NAME: ${{ secrets.FROM_NAME }}
+          SUBSCRIBERS: ${{ secrets.SUBSCRIBERS }}
+        run: python main.py
