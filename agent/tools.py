@@ -1,6 +1,7 @@
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 from sources.hackernews import fetch_hn_stories
 from sources.newsapi import fetch_newsapi_articles
 from sources.rss_feeds import fetch_rss_articles
@@ -97,6 +98,18 @@ def _parse_date(date_str: str) -> datetime:
     return datetime.min.replace(tzinfo=timezone.utc)
 
 
+def _is_recent(article: dict, hours: int = 48) -> bool:
+    """Returns True if article is within the last `hours`, or has no date (can't tell)."""
+    date_str = article.get("published_at", "")
+    if not date_str:
+        return True  # no date = keep it, don't throw away potentially fresh content
+    dt = _parse_date(date_str)
+    if dt == datetime.min.replace(tzinfo=timezone.utc):
+        return True  # unparseable = keep
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    return dt >= cutoff
+
+
 def _llm_summarize_and_select(articles: list[dict], category: str, count: int) -> list[dict]:
     """
     Single LLM call that:
@@ -186,14 +199,18 @@ Return JSON only, no other text."""
 def tool_get_top_news(category: str, count: int | str) -> dict:
     count = int(count)
 
-    # Fetch from all sources
-    raw = []
-    raw += fetch_hn_stories(category, limit=20)
-    raw += fetch_rss_articles(category, limit=25)
-    raw += fetch_devto_articles(category, limit=20)
-    raw += fetch_newsapi_articles(category, limit=25)
-    if category == "ai":
-        raw += fetch_arxiv_papers(category, limit=15)
+    # Fetch all sources in parallel
+    def _hn():  return fetch_hn_stories(category, limit=20)
+    def _rss(): return fetch_rss_articles(category, limit=25)
+    def _dev(): return fetch_devto_articles(category, limit=20)
+    def _nws(): return fetch_newsapi_articles(category, limit=25)
+    def _arx(): return fetch_arxiv_papers(category, limit=15) if category == "ai" else []
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = [ex.submit(f) for f in (_hn, _rss, _dev, _nws, _arx)]
+        raw = []
+        for f in futures:
+            raw += f.result()
 
     # Deduplicate by title
     seen = set()
@@ -204,13 +221,15 @@ def tool_get_top_news(category: str, count: int | str) -> dict:
             seen.add(key)
             deduped.append(a)
 
+    # Keep only last 48 hours (articles with no date are kept)
+    recent = [a for a in deduped if _is_recent(a, hours=48)]
+
     # Sort by most recent first
-    deduped.sort(key=lambda a: _parse_date(a.get("published_at", "")), reverse=True)
+    recent.sort(key=lambda a: _parse_date(a.get("published_at", "")), reverse=True)
 
     # Take top 30 candidates
-    candidates = deduped[:CANDIDATES_PER_CATEGORY]
-
-    print(f"[tools] {category}: {len(deduped)} total → {len(candidates)} candidates → LLM selects {count}")
+    candidates = recent[:CANDIDATES_PER_CATEGORY]
+    print(f"[tools] {category}: {len(deduped)} total → {len(recent)} recent (48h) → {len(candidates)} candidates → LLM selects {count}")
 
     # LLM summarizes all candidates and picks the best `count`
     selected = _llm_summarize_and_select(candidates, category, count)
