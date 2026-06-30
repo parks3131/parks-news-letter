@@ -88,14 +88,54 @@ TOOL_SCHEMAS = [
 
 # ── Tool implementations ───────────────────────────────────────────────────────
 
-def tool_get_top_news(category: str, count: int) -> dict:
-    articles = []
-    articles += fetch_hn_stories(category, limit=20)
-    articles += fetch_rss_articles(category, limit=20)
-    articles += fetch_devto_articles(category, limit=15)
-    if category == "ai":
-        articles += fetch_arxiv_papers(category, limit=10)
-    articles += fetch_newsapi_articles(category, limit=20)  # only fires if key is set
+def _generate_summaries(articles: list[dict]) -> list[dict]:
+    """Use the LLM to write 2-sentence summaries for articles that lack them."""
+    from openai import OpenAI
+    from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL
+
+    needs_summary = [a for a in articles if not a.get("summary") or len(a.get("summary", "")) < 30]
+    if not needs_summary:
+        return articles
+
+    client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
+    titles_block = "\n".join(f"{i+1}. {a['title']}" for i, a in enumerate(needs_summary))
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENROUTER_MODEL,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Write a 2-sentence factual summary for each headline below. "
+                    "Be concise and informative. Return ONLY a numbered list matching the input order.\n\n"
+                    + titles_block
+                )
+            }],
+            max_tokens=800,
+        )
+        lines = [l.strip() for l in resp.choices[0].message.content.strip().split("\n") if l.strip()]
+        summaries = [l.split(". ", 1)[-1] if l[0].isdigit() else l for l in lines]
+
+        for i, a in enumerate(needs_summary):
+            if i < len(summaries):
+                a["summary"] = summaries[i]
+    except Exception:
+        pass
+
+    return articles
+
+
+def tool_get_top_news(category: str, count: int | str) -> dict:
+    count = int(count)
+    # Cap HN at 4 so RSS/NewsAPI articles with real summaries fill the rest
+    hn = fetch_hn_stories(category, limit=10)[:4]
+    rss = fetch_rss_articles(category, limit=20)
+    devto = fetch_devto_articles(category, limit=15)
+    arxiv = fetch_arxiv_papers(category, limit=10) if category == "ai" else []
+    newsapi = fetch_newsapi_articles(category, limit=20)
+
+    # Prefer articles with real summaries first, then fill with HN
+    articles = rss + newsapi + devto + arxiv + hn
 
     seen = set()
     deduped = []
@@ -105,11 +145,15 @@ def tool_get_top_news(category: str, count: int) -> dict:
             seen.add(key)
             deduped.append(a)
 
-    ranked = sorted(deduped, key=lambda x: x.get("score", 0), reverse=True)[:count]
+    # Score: articles with real summaries get a +50 boost
+    def rank_score(a):
+        has_summary = len(a.get("summary", "")) > 40
+        return a.get("score", 0) + (50 if has_summary else 0)
 
-    for a in ranked:
-        if not a.get("summary"):
-            a["summary"] = f"Trending {category.replace('_', '/')} story from {a.get('source', 'the web')}."
+    ranked = sorted(deduped, key=rank_score, reverse=True)[:count]
+
+    # Generate LLM summaries for any still missing
+    ranked = _generate_summaries(ranked)
 
     _state[category] = ranked
     return {"fetched": len(ranked), "category": category, "titles": [a["title"] for a in ranked]}
