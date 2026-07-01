@@ -263,7 +263,13 @@ def tool_get_subscribers() -> list[str]:
     return get_all_subscribers()
 
 
-def tool_send_newsletter(subject: str, recipients: list[str]) -> dict:
+def tool_send_newsletter(subject: str, recipients: list[str] | str) -> dict:
+    if isinstance(recipients, str):
+        try:
+            recipients = json.loads(recipients)
+        except Exception:
+            recipients = [r.strip() for r in recipients.split(",") if r.strip()]
+
     if not _state.get("composed"):
         return {"error": "compose_newsletter must be called first."}
     if not recipients:
