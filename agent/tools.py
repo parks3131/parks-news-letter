@@ -7,6 +7,7 @@ from sources.newsapi import fetch_newsapi_articles
 from sources.rss_feeds import fetch_rss_articles
 from sources.devto import fetch_devto_articles
 from sources.arxiv import fetch_arxiv_papers
+from sources.reddit import fetch_reddit_posts
 from subscribers.db import get_all_subscribers
 from mailer.sender import send_email
 
@@ -98,7 +99,7 @@ def _parse_date(date_str: str) -> datetime:
     return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def _is_recent(article: dict, hours: int = 48) -> bool:
+def _is_recent(article: dict, hours: int = 24) -> bool:
     """Returns True if article is within the last `hours`, or has no date (can't tell)."""
     date_str = article.get("published_at", "")
     if not date_str:
@@ -205,9 +206,10 @@ def tool_get_top_news(category: str, count: int | str) -> dict:
     def _dev(): return fetch_devto_articles(category, limit=20)
     def _nws(): return fetch_newsapi_articles(category, limit=25)
     def _arx(): return fetch_arxiv_papers(category, limit=15) if category == "ai" else []
+    def _rdt(): return fetch_reddit_posts(category, limit=20)
 
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        futures = [ex.submit(f) for f in (_hn, _rss, _dev, _nws, _arx)]
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futures = [ex.submit(f) for f in (_hn, _rss, _dev, _nws, _arx, _rdt)]
         raw = []
         for f in futures:
             try:
@@ -224,15 +226,15 @@ def tool_get_top_news(category: str, count: int | str) -> dict:
             seen.add(key)
             deduped.append(a)
 
-    # Keep only last 48 hours (articles with no date are kept)
-    recent = [a for a in deduped if _is_recent(a, hours=48)]
+    # Keep only last 24 hours (articles with no date are kept)
+    recent = [a for a in deduped if _is_recent(a, hours=24)]
 
     # Sort by most recent first
     recent.sort(key=lambda a: _parse_date(a.get("published_at", "")), reverse=True)
 
-    # Take top 30 candidates
+    # Take top candidates
     candidates = recent[:CANDIDATES_PER_CATEGORY]
-    print(f"[tools] {category}: {len(deduped)} total → {len(recent)} recent (48h) → {len(candidates)} candidates → LLM selects {count}")
+    print(f"[tools] {category}: {len(deduped)} total → {len(recent)} recent (24h) → {len(candidates)} candidates → LLM selects {count}")
 
     # LLM summarizes all candidates and picks the best `count`
     selected = _llm_summarize_and_select(candidates, category, count)
