@@ -37,9 +37,8 @@ def _send_via_smtp(to: str, subject: str, html: str, plain: str) -> bool:
     smtp_pass = os.getenv("SMTP_PASS", "")
 
     if not smtp_user or not smtp_pass:
-        print(f"[email] SMTP not configured — would send to {to}")
-        print(f"[email] Subject: {subject}")
-        return True  # dry run success
+        print(f"[email] ERROR: No RESEND_API_KEY and no SMTP credentials — email NOT sent to {to}")
+        return False
 
     try:
         msg = MIMEMultipart("alternative")
