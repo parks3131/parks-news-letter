@@ -10,7 +10,7 @@ from sources.arxiv import fetch_arxiv_papers
 from subscribers.db import get_all_subscribers
 from mailer.sender import send_email
 
-CANDIDATES_PER_CATEGORY = 30
+CANDIDATES_PER_CATEGORY = 15
 
 # ── Server-side state ──────────────────────────────────────────────────────────
 _state: dict = {
@@ -259,8 +259,23 @@ def tool_compose_newsletter() -> dict:
 def tool_get_subscribers() -> list[str]:
     env_subscribers = os.getenv("SUBSCRIBERS", "")
     if env_subscribers:
-        return [e.strip() for e in env_subscribers.split(",") if e.strip()]
-    return get_all_subscribers()
+        emails = [e.strip() for e in env_subscribers.split(",") if e.strip()]
+        print(f"[tools] Subscribers from env: {emails}")
+        return emails
+
+    db_subscribers = get_all_subscribers()
+    if db_subscribers:
+        print(f"[tools] Subscribers from DB: {db_subscribers}")
+        return db_subscribers
+
+    # Fallback: send to FROM_EMAIL so CI runs are never silently swallowed
+    from config import FROM_EMAIL
+    if FROM_EMAIL and "@" in FROM_EMAIL:
+        print(f"[tools] WARNING: No SUBSCRIBERS env or DB — falling back to FROM_EMAIL: {FROM_EMAIL}")
+        return [FROM_EMAIL]
+
+    print("[tools] WARNING: No recipients found — email will be skipped")
+    return []
 
 
 def tool_send_newsletter(subject: str, recipients: list[str] | str) -> dict:
