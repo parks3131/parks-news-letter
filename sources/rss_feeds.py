@@ -1,7 +1,8 @@
 import re
+import requests
 import feedparser
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 RSS_FEEDS = {
     "ai": [
@@ -54,7 +55,8 @@ RSS_FEEDS = {
 
 def _fetch_one_feed(feed_url: str, category: str) -> list[dict]:
     try:
-        feed = feedparser.parse(feed_url)
+        resp = requests.get(feed_url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        feed = feedparser.parse(resp.content)
         articles = []
         for entry in feed.entries[:4]:
             title = entry.get("title", "").strip()
@@ -86,10 +88,16 @@ def fetch_rss_articles(category: str, limit: int = 20) -> list[dict]:
     feed_urls = RSS_FEEDS.get(category, [])
     results = []
 
-    # Fetch all feeds in parallel
+    # Fetch all feeds in parallel with a hard cap of 25s total
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(_fetch_one_feed, url, category): url for url in feed_urls}
-        for future in as_completed(futures):
-            results.extend(future.result())
+        try:
+            for future in as_completed(futures, timeout=25):
+                try:
+                    results.extend(future.result())
+                except Exception:
+                    pass
+        except TimeoutError:
+            pass  # keep whatever arrived before the deadline
 
     return results[:limit]

@@ -1,5 +1,6 @@
 import requests
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 
 HN_BASE = "https://hacker-news.firebaseio.com/v0"
 
@@ -26,6 +27,9 @@ def _matches_keywords(text: str, keywords: set) -> bool:
 
 
 def fetch_hn_stories(category: str, limit: int = 30) -> list[dict]:
+    if category == "immigration":
+        return []  # HN rarely has immigration news
+
     keywords = AI_KEYWORDS if category == "ai" else STARTUP_JOB_KEYWORDS
 
     try:
@@ -33,15 +37,17 @@ def fetch_hn_stories(category: str, limit: int = 30) -> list[dict]:
     except Exception:
         return []
 
+    # Fetch top 50 stories in parallel (not 100 sequentially)
+    candidates = top_ids[:50]
+    with ThreadPoolExecutor(max_workers=15) as ex:
+        stories = list(ex.map(_fetch_story, candidates, timeout=20))
+
     results = []
-    for story_id in top_ids[:100]:
-        if len(results) >= limit:
-            break
-        story = _fetch_story(story_id)
+    for story in stories:
         if not story or story.get("type") != "story":
             continue
         title = story.get("title", "")
-        url = story.get("url", f"https://news.ycombinator.com/item?id={story_id}")
+        url = story.get("url", f"https://news.ycombinator.com/item?id={story.get('id')}")
         if _matches_keywords(title, keywords):
             results.append({
                 "title": title,
@@ -53,5 +59,7 @@ def fetch_hn_stories(category: str, limit: int = 30) -> list[dict]:
                 ).isoformat(),
                 "category": category,
             })
+        if len(results) >= limit:
+            break
 
     return results

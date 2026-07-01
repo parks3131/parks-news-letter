@@ -164,7 +164,7 @@ Return JSON only, no other text."""
         resp = client.chat.completions.create(
             model=OPENROUTER_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=1500,
+            max_tokens=800,
         )
         raw = resp.choices[0].message.content.strip()
 
@@ -210,7 +210,10 @@ def tool_get_top_news(category: str, count: int | str) -> dict:
         futures = [ex.submit(f) for f in (_hn, _rss, _dev, _nws, _arx)]
         raw = []
         for f in futures:
-            raw += f.result()
+            try:
+                raw += f.result(timeout=45)
+            except Exception:
+                pass
 
     # Deduplicate by title
     seen = set()
